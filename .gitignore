@@ -1,0 +1,4 @@
+certs/
+*.pem
+*.p12
+*.srl

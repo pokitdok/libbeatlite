@@ -10,17 +10,19 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
 
-var DEBUG = false
+const Version = "0.3.0"
+
+var newlineRe = regexp.MustCompile("[\\r\\n]+")
 
 type Message struct {
 	Source  map[string]interface{} // This is what gets indexed. Send() will add field "@timestamp", which will have current time in UTC
@@ -31,33 +33,32 @@ type Message struct {
 }
 
 type Client struct {
-	URL       string `json:"elasticsearch_url"`          // URL of the elasticsearch ingest node: http://locahost:9200
-	Name      string `json:"beat_name"`                  // Index name is set by appending "-YYYY.MM.DD" to Name
-	CA        string `json:"ca_cert_file_name"`          // Path of the file containing the PEM-encoded CA cert to use; if not set, host's default CAs are used
-	Insecure  bool   `json:"ignore_invalid_server_cert"` // If True, skip TLS cert verification (expiration, host name, etc)
-	Noop      bool   `json:"-"`                          // If True, do not call elasticsearch
-	certPool  *x509.CertPool
-	transport *http.Transport
-	client    *http.Client
-	hostname  string
+	URL            string `json:"elasticsearch_url"`          // URL of the elasticsearch ingest node: http://locahost:9200
+	Name           string `json:"beat_name"`                  // Index name is set by appending "-YYYY.MM.DD" to Name
+	Insecure       bool   `json:"ignore_invalid_server_cert"` // If True, skip TLS cert verification (expiration, host name, etc)
+	CACertFile     string `json:"ca_cert_file_name"`          // Path of the file containing the PEM-encoded CA cert to use; if not set, host's default CAs are used
+	ClientCertFile string `json:"client_cert_file_name"`      // If set, load client certificate from named file
+	ClientKeyFile  string `json:"client_key_file_name"`       // If set, load client key from named file
+	Noop           bool   `json:"-"`                          // If True, do not call elasticsearch
+	Debug          bool   `json:"-"`
+	certPool       *x509.CertPool
+	transport      *http.Transport
+	client         *http.Client
+	hostname       string
 }
 
-func loadCert(path string) (*x509.CertPool, error) {
+func loadCACert(path string) (*x509.CertPool, error) {
 
 	b, err := ioutil.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("error reading cert file: %v", err)
 	}
 
-	block, _ := pem.Decode(b)
-
-	c, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("error loading ca cert: %v", err)
-	}
-
 	p := x509.NewCertPool()
-	p.AddCert(c)
+	ok := p.AppendCertsFromPEM(b)
+	if !ok {
+		return nil, fmt.Errorf("error adding certificates from file %q", path)
+	}
 
 	return p, nil
 }
@@ -73,8 +74,8 @@ func (c *Client) init() error {
 		c.Name = "libbeatlite"
 	}
 
-	if c.CA != "" {
-		p, err := loadCert(c.CA)
+	if c.CACertFile != "" {
+		p, err := loadCACert(c.CACertFile)
 		if err != nil {
 			return fmt.Errorf("error initializing client: %v", err)
 		}
@@ -84,6 +85,14 @@ func (c *Client) init() error {
 	t := &tls.Config{
 		InsecureSkipVerify: c.Insecure,
 		RootCAs:            c.certPool,
+	}
+
+	if c.ClientCertFile != "" {
+		cert, err := tls.LoadX509KeyPair(c.ClientCertFile, c.ClientKeyFile)
+		if err != nil {
+			return fmt.Errorf("error reading client certificate: %v", err)
+		}
+		t.Certificates = []tls.Certificate{cert}
 	}
 
 	c.transport = &http.Transport{TLSClientConfig: t}
@@ -134,7 +143,7 @@ func (c *Client) prep(m *Message) error {
 		m.Doctype = "log"
 	}
 
-	if DEBUG {
+	if c.Debug {
 		log.Println(string(b))
 	}
 	return nil
@@ -155,12 +164,12 @@ func (c *Client) Send(m *Message) ([]byte, error) {
 	}
 
 	url := strings.Join([]string{c.URL, m.Index, m.Doctype, m.Id}, "/")
-	if DEBUG {
+	if c.Debug {
 		log.Println(url)
 	}
 
 	if c.Noop {
-		if DEBUG {
+		if c.Debug {
 			log.Println("NOOP: not sending request to elasticsearch")
 		}
 		return nil, nil
@@ -177,8 +186,15 @@ func (c *Client) Send(m *Message) ([]byte, error) {
 		return nil, fmt.Errorf("error reading response: %v", err)
 	}
 
-	if DEBUG {
-		log.Println(string(b))
+	if c.Debug {
+		// TODO: limit the length of output, trust no one
+		log.Println(resp.StatusCode, newlineRe.ReplaceAllString(string(b), ""))
 	}
+
+	codes := map[int]bool{200: true, 201: true}
+	if !codes[resp.StatusCode] {
+		return b, fmt.Errorf("unexpected http status code %d", resp.StatusCode)
+	}
+
 	return b, nil
 }
