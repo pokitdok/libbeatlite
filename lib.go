@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -20,8 +21,9 @@ import (
 	"time"
 )
 
-const Version = "0.3.0"
+const Version = "0.3.1"
 
+// will be used for stripping newlines from log output in debug mode
 var newlineRe = regexp.MustCompile("[\\r\\n]+")
 
 type Message struct {
@@ -180,19 +182,18 @@ func (c *Client) Send(m *Message) ([]byte, error) {
 		return nil, fmt.Errorf("error sending message: %v", err)
 	}
 	defer resp.Body.Close()
-
-	b, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error reading response: %v", err)
-	}
+	// read at most 4096 bytes of the response; trust no one
+	b := make([]byte, 4096)
+	io.ReadFull(resp.Body, b)
 
 	if c.Debug {
-		// TODO: limit the length of output, trust no one
+		// this is ok because response body length limited to 4k
 		log.Println(resp.StatusCode, newlineRe.ReplaceAllString(string(b), ""))
 	}
 
-	codes := map[int]bool{200: true, 201: true}
-	if !codes[resp.StatusCode] {
+	switch resp.StatusCode {
+	case 200, 201:
+	default:
 		return b, fmt.Errorf("unexpected http status code %d", resp.StatusCode)
 	}
 
